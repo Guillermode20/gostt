@@ -1,0 +1,71 @@
+# Dockerfile.gott-dev — alternative to distrobox.ini for vanilla Docker
+# environments. Build with:
+#
+#   docker build -f Dockerfile.gott-dev -t gott-dev .
+#   docker run -it --rm \
+#       --device /dev/snd --device /dev/uinput \
+#       --group-add audio --group-add input \
+#       -v "$PWD":/go/src/github.com/gott/gott \
+#       -w /go/src/github.com/gott/gott \
+#       gott-dev bash
+#
+# Multi-arch note: TARGETARCH comes from `docker buildx build`. The
+# Go tarball and ONNX runtime URLs vary by arch; we expand them below.
+
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04
+
+ARG TARGETARCH=amd64
+ARG GO_VERSION=1.23.4
+ARG ONNXRUNTIME_VERSION=1.18.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/usr/local/go/bin:/go/bin:$PATH
+ENV GOPATH=/go
+
+# System packages: ALSA, GTK3, AppIndicator, uinput, Vulkan, X11 helpers,
+# and sudo (needed by scripts/dev-bootstrap.sh inside distrobox).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl wget git pkg-config sudo \
+        libasound2-dev libpulse-dev libgtk-3-dev libgtk-3-bin \
+        libayatana-appindicator3-dev libxdo-dev libxtst-dev \
+        libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+        libvulkan1 mesa-vulkan-drivers \
+        xdg-utils dbus && \
+    rm -rf /var/lib/apt/lists/*
+
+# Go toolchain. We download to a temp file first, verify, then extract —
+# never pipe curl straight into tar (a partial download would leave a
+# half-extracted install directory that hides a broken Go on $PATH).
+RUN set -eux; \
+    curl -fsSL -o /tmp/go.tgz \
+        "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz"; \
+    tar -C /usr/local -xzf /tmp/go.tgz; \
+    rm -f /tmp/go.tgz; \
+    go version
+
+# ONNX Runtime C library. Symlinked into /usr/local/lib so the cgo
+# linker resolves it without any extra env.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) ORT_ARCH=linux-x64 ;; \
+        arm64) ORT_ARCH=linux-aarch64 ;; \
+        *) echo "unsupported arch ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ORT_DIR=/opt/onnxruntime-${ORT_ARCH}-${ONNXRUNTIME_VERSION}; \
+    curl -fsSL -o /tmp/onnxruntime.tgz \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-${ORT_ARCH}-${ONNXRUNTIME_VERSION}.tgz"; \
+    mkdir -p /opt; \
+    tar -C /opt -xzf /tmp/onnxruntime.tgz; \
+    ln -sf "${ORT_DIR}/lib/libonnxruntime.so" /usr/local/lib/libonnxruntime.so; \
+    ldconfig; \
+    rm -f /tmp/onnxruntime.tgz; \
+    echo "LD_LIBRARY_PATH=${ORT_DIR}/lib:${LD_LIBRARY_PATH}" > /etc/profile.d/gott-ort.sh
+
+# Working dir + non-root user so `go build` doesn't need --privileged.
+WORKDIR /go/src/github.com/gott/gott
+RUN groupadd -g 1000 gott && useradd -m -u 1000 -g gott gott && \
+    chown -R gott:gott /go
+USER gott
+
+CMD ["/bin/bash"]
