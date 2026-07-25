@@ -97,14 +97,16 @@ func FindModel(id string) *ModelInfo {
 // Resolves $XDG_DATA_HOME/gostt/models/<filename> or, if unset,
 // ~/.local/share/gostt/models/<filename>. The directory is created.
 func ModelDir(m ModelInfo) (string, error) {
-	base, err := os.UserConfigDir() // safer than UserDataDir (linux returns same)
-	var dir string
-	if err == nil {
-	dir = filepath.Join(base, "..", "share", "gostt", "models", m.Filename)
-	} else {
-		home, _ := os.UserHomeDir()
-	dir = filepath.Join(home, ".local", "share", "gostt", "models", m.Filename)
+	// XDG_DATA_HOME defaults to ~/.local/share.
+	share := os.Getenv("XDG_DATA_HOME")
+	if share == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot find home directory: %w", err)
+		}
+		share = filepath.Join(home, ".local", "share")
 	}
+	dir := filepath.Join(share, "gostt", "models", m.Filename)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -151,8 +153,8 @@ func DownloadModel(ctx context.Context, m ModelInfo, fn ProgressFn) error {
 		default:
 		}
 		dest := filepath.Join(dir, sf.Name)
-		// Skip files we already have at the expected size (best effort).
-		if fi, err := os.Stat(dest); err == nil && sf.SizeBytes > 0 && fi.Size() == sf.SizeBytes {
+		// Skip files we already have (non-zero size).
+		if fi, err := os.Stat(dest); err == nil && fi.Size() > 0 {
 			done += sf.SizeBytes
 			fn(done, total)
 			continue
@@ -286,6 +288,10 @@ func downloadParallel(ctx context.Context, sf SubFile, dest string, totalSize in
 	}
 
 	progress(totalSize)
+	if err := assembleChunks(part, len(chunks)); err != nil {
+		_ = os.Remove(part)
+		return nil, downloaded.Load(), err
+	}
 	if err := os.Rename(part, dest); err != nil {
 		return nil, totalSize, err
 	}
