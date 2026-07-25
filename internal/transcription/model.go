@@ -12,7 +12,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +26,16 @@ type SubFile struct {
 	// SizeBytes can be 0 (unknown); in that case progress is reported as
 	// "downloaded N bytes" without a percentage.
 	SizeBytes int64
+}
+// hfToken returns the HuggingFace API token from the environment.
+// Authenticated requests get significantly higher rate limits.
+func hfToken() string {
+	for _, k := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"} {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ModelInfo describes a single model that gostt knows how to use.
@@ -157,23 +170,260 @@ func DownloadModel(ctx context.Context, m ModelInfo, fn ProgressFn) error {
 // downloadOne streams a single file to <dest>.part then renames it. total
 // returns the size actually downloaded (== Content-Length when known).
 //
-// Improvements over naive io.Copy:
-//   - 1 MiB read buffer (vs 32 KiB) — cuts syscall count ~32× for large files.
-//   - bufio.Writer — batches small writes into larger disk flushes.
-//   - Retry with exponential backoff on transient read errors.
-//   - User-Agent header — some CDNs throttle bare requests.
-//   - HTTP Range resume — picks up from where .part left off when possible.
+// For files > 100 MB and servers supporting Range requests, the download
+// is split across multiple parallel connections to bypass per-connection
+// CDN throttling. An HF_TOKEN environment variable enables authenticated
+// HuggingFace requests with higher rate limits.
 func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d int64)) (io.Closer, int64, error) {
 	const (
-		readBufSize = 1 << 20 // 1 MiB
-		writeBufSize = 1 << 20 // 1 MiB
-		maxRetries   = 5
-		retryBase    = 2 * time.Second
+		readBufSize     = 1 << 20 // 1 MiB
+		writeBufSize    = 1 << 20 // 1 MiB
+		maxRetries      = 5
+		retryBase       = 2 * time.Second
+		parallelMinSize = 100 << 20 // 100 MB — threshold for parallel download
+	)
+
+
+	// Probe the server: can we resume, and does it support Range?
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sf.URL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	setHeaders(req)
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp.Body.Close()
+
+	totalSize := sf.SizeBytes
+	if resp.ContentLength > 0 {
+		totalSize = resp.ContentLength
+	}
+	supportsRange := resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
+	acceptRanges := strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
+
+	// Decide: parallel or single-stream?
+	if totalSize >= parallelMinSize && (acceptRanges || supportsRange) {
+		return downloadParallel(ctx, sf, dest, totalSize, progress)
+	}
+	return downloadSingle(ctx, sf, dest, progress)
+}
+
+// downloadParallel splits a file into chunks and downloads them concurrently.
+// Each chunk is written to a separate temp file, then assembled into the
+// final .part file. This bypasses per-connection throttling on CDNs.
+func downloadParallel(ctx context.Context, sf SubFile, dest string, totalSize int64, progress func(d int64)) (io.Closer, int64, error) {
+	const (
+		readBufSize = 1 << 20
+		chunkSize   = 50 << 20 // 50 MB
+		maxParallel = 4
+	)
+	part := dest + ".part"
+
+	// Check for partial resume — how much do we already have?
+	var done int64
+	if fi, err := os.Stat(part); err == nil {
+		done = fi.Size()
+	}
+	if done >= totalSize {
+		// Already complete (shouldn't happen, but be safe).
+		if err := os.Rename(part, dest); err != nil {
+			return nil, 0, err
+		}
+		return nil, done, nil
+	}
+
+	workers := runtime.NumCPU()
+	if workers > maxParallel {
+		workers = maxParallel
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	// Calculate chunk boundaries.
+	type chunk struct {
+		start, end int64
+		index      int
+	}
+	var chunks []chunk
+	for off := done; off < totalSize; {
+		end := off + chunkSize
+		if end > totalSize {
+			end = totalSize
+		}
+		chunks = append(chunks, chunk{start: off, end: end, index: len(chunks)})
+		off = end
+	}
+
+	var downloaded atomic.Int64
+	downloaded.Store(done)
+
+	// Semaphore to limit concurrency.
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	errs := make([]error, len(chunks))
+
+	for i, c := range chunks {
+		wg.Add(1)
+		go func(idx int, c chunk) {
+			defer wg.Done()
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
+			errs[idx] = downloadChunk(ctx, sf.URL, part, c.start, c.end, c.index, &downloaded, progress)
+		}(i, c)
+	}
+	wg.Wait()
+
+	// Check for errors.
+	for _, e := range errs {
+		if e != nil {
+			_ = os.Remove(part)
+			return nil, downloaded.Load(), e
+		}
+	}
+
+	progress(totalSize)
+	if err := os.Rename(part, dest); err != nil {
+		return nil, totalSize, err
+	}
+	return nil, totalSize, nil
+}
+
+// downloadChunk downloads a byte range into a temp file, then splices it
+// into the main .part file via a write lock.
+func downloadChunk(ctx context.Context, url, part string, start, end int64, index int, downloaded *atomic.Int64, progress func(d int64)) error {
+	const (
+		readBufSize = 1 << 20
+		maxRetries  = 3
+		retryBase   = 2 * time.Second
+	)
+
+	chunkPath := fmt.Sprintf("%s.chunk%d", part, index)
+	// If chunk file already exists with correct size, skip.
+	if fi, err := os.Stat(chunkPath); err == nil && fi.Size() == (end-start) {
+		downloaded.Add(end - start)
+		progress(downloaded.Load())
+		return nil
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			wait := retryBase * time.Duration(1<<uint(attempt-1))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		setHeaders(req)
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end-1))
+
+		client := &http.Client{Timeout: 0}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d for range %d-%d", resp.StatusCode, start, end-1)
+			continue
+		}
+
+		f, err := os.OpenFile(chunkPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			resp.Body.Close()
+			lastErr = err
+			continue
+		}
+
+		buf := make([]byte, readBufSize)
+		for {
+			nr, rerr := resp.Body.Read(buf)
+			if nr > 0 {
+				if _, werr := f.Write(buf[:nr]); werr != nil {
+					f.Close()
+					resp.Body.Close()
+					lastErr = werr
+					break
+				}
+				downloaded.Add(int64(nr))
+				progress(downloaded.Load())
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				lastErr = rerr
+				break
+			}
+		}
+		f.Close()
+		resp.Body.Close()
+		if lastErr == nil {
+			return nil // success
+		}
+	}
+	return fmt.Errorf("chunk %d (%d-%d) failed after retries: %w", index, start, end-1, lastErr)
+}
+
+// assembleChunks merges .chunkN files into the .part file, then deletes chunks.
+// Must be called after all chunks succeed.
+func assembleChunks(part string, numChunks int) error {
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	buf := make([]byte, 1<<20)
+	for i := 0; i < numChunks; i++ {
+		chunkPath := fmt.Sprintf("%s.chunk%d", part, i)
+		cf, err := os.Open(chunkPath)
+		if err != nil {
+			return fmt.Errorf("open chunk %d: %w", i, err)
+		}
+		for {
+			n, rerr := cf.Read(buf)
+			if n > 0 {
+				if _, werr := f.Write(buf[:n]); werr != nil {
+					cf.Close()
+					return werr
+				}
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				cf.Close()
+				return rerr
+			}
+		}
+		cf.Close()
+		os.Remove(chunkPath)
+	}
+	return nil
+}
+
+// downloadSingle is the original single-stream download with retry/resume.
+func downloadSingle(ctx context.Context, sf SubFile, dest string, progress func(d int64)) (io.Closer, int64, error) {
+	const (
+		readBufSize = 1 << 20
+		writeBufSize = 1 << 20
+		maxRetries  = 5
+		retryBase   = 2 * time.Second
 	)
 
 	part := dest + ".part"
-
-	// Check if we have a partial download to resume from.
 	var resumeOffset int64
 	if fi, err := os.Stat(part); err == nil && fi.Size() > 0 {
 		resumeOffset = fi.Size()
@@ -183,30 +433,25 @@ func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d i
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("User-Agent", "gostt/1.0 (https://github.com/Guillermode20/gostt)")
+	setHeaders(req)
 	if resumeOffset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
 	}
 
-	client := &http.Client{Timeout: 0} // honour ctx instead
+	client := &http.Client{Timeout: 0}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
-	// Accept 200 (full) or 206 (partial) responses.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return nil, 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
-	// If server doesn't support resume (returned 200 instead of 206), reset offset.
 	if resp.StatusCode == http.StatusOK {
 		resumeOffset = 0
 	}
 
-
-	// Open for append if resuming, truncate if fresh.
 	flags := os.O_CREATE | os.O_WRONLY
 	if resumeOffset == 0 {
 		flags |= os.O_TRUNC
@@ -221,7 +466,6 @@ func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d i
 	var totalRead int64 = resumeOffset
 	last := time.Now()
 
-	// Wrapped in retry loop for transient network errors.
 	for attempt := 0; ; attempt++ {
 		buf := make([]byte, readBufSize)
 		bw := bufio.NewWriterSize(out, writeBufSize)
@@ -246,23 +490,21 @@ func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d i
 			}
 			if rerr != nil {
 				_ = bw.Flush()
-				// Retry on transient errors (connection reset, timeout).
 				if attempt < maxRetries && isRetryable(rerr) {
 					_ = resp.Body.Close()
-					wait := retryBase * time.Duration(1<<uint(attempt)) // exponential backoff
+					wait := retryBase * time.Duration(1<<uint(attempt))
 					select {
 					case <-ctx.Done():
 						_ = out.Close()
 						return nil, totalRead, ctx.Err()
 					case <-time.After(wait):
 					}
-					// Re-issue request with updated Range header.
 					req2, err := http.NewRequestWithContext(ctx, http.MethodGet, sf.URL, nil)
 					if err != nil {
 						_ = out.Close()
 						return nil, totalRead, err
 					}
-					req2.Header.Set("User-Agent", "gostt/1.0 (https://github.com/Guillermode20/gostt)")
+					setHeaders(req2)
 					req2.Header.Set("Range", fmt.Sprintf("bytes=%d-", totalRead))
 					resp2, err := client.Do(req2)
 					if err != nil {
@@ -278,7 +520,7 @@ func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d i
 			}
 		}
 		_ = bw.Flush()
-		break // success
+		break
 	}
 
 	progress(totalRead)
@@ -291,6 +533,14 @@ func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d i
 	return nil, totalRead, nil
 }
 
+// setHeaders adds User-Agent and optional HF_TOKEN auth to a request.
+func setHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "gostt/1.0 (https://github.com/Guillermode20/gostt)")
+	if token := hfToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 // isRetryable reports whether err is likely transient and worth retrying.
 func isRetryable(err error) bool {
 	if errors.Is(err, io.ErrUnexpectedEOF) {
@@ -300,7 +550,6 @@ func isRetryable(err error) bool {
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
-	// "connection reset by peer" and similar
 	s := err.Error()
 	return strings.Contains(s, "connection reset") ||
 		strings.Contains(s, "broken pipe") ||
