@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	gostt                       launch GUI + system tray (default)
+//	gostt run                   launch GUI + system tray
 //	gostt list                  list available microphones
 //	gostt download              download the default model (~670 MB)
 //	gostt record [seconds]      record N seconds and print transcription
@@ -58,6 +58,10 @@ func main() {
 	}
 
 	switch args[0] {
+	case "run":
+		if err := runGUI(); err != nil {
+			fail(err)
+		}
 	case "list":
 		runList()
 	case "download":
