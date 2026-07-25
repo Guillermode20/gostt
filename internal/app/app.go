@@ -16,15 +16,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/gott/gott/internal/audio"
-	"github.com/gott/gott/internal/clipboard"
-	"github.com/gott/gott/internal/hotkey"
-	"github.com/gott/gott/internal/inputsim"
-	"github.com/gott/gott/internal/settings"
-	"github.com/gott/gott/internal/transcription"
-	"github.com/gott/gott/internal/tray"
+	"github.com/Guillermode20/gostt/internal/audio"
+	"github.com/Guillermode20/gostt/internal/clipboard"
+	"github.com/Guillermode20/gostt/internal/hotkey"
+	"github.com/Guillermode20/gostt/internal/inputsim"
+	"github.com/Guillermode20/gostt/internal/settings"
+	"github.com/Guillermode20/gostt/internal/transcription"
+	"github.com/Guillermode20/gostt/internal/tray"
 )
 
 // State is the high-level UI state fanned out via chanUpdate. Mirrored to
@@ -60,14 +61,18 @@ func (s State) String() string {
 
 // Update is broadcast from the Worker to the UI / tray.
 type Update struct {
-	State         State
-	Status        string
-	Transcription string
-	InputLevel    float32 // 0..1; -1 means "do not update"
-	Mics          []audio.MicInfo
-	Hotkey        string
-	ModelSize     int64
-	ModelReady    bool
+	State           State
+	Status          string
+	Transcription   string
+	InputLevel      float32 // 0..1; -1 means "do not update"
+	Mics            []audio.MicInfo
+	Hotkey          string
+	ModelSize       int64
+	ModelReady      bool
+	Downloading     bool
+	DownloadPct     float64 // 0..100
+	DownloadBytes   int64
+	DownloadTotal   int64
 }
 
 // WorkerMsg is inbound to the Worker. We use a plain interface{} so that
@@ -220,10 +225,10 @@ func (a *App) Shutdown(timeout time.Duration) error {
 	return nil
 }
 
-// requestShutdown cancels the internal shutdown signal so worker loops
+// RequestShutdown cancels the internal shutdown signal so worker loops
 // can exit. Intended for the workflow where the orchestrator owns a
 // context and Shutdown originates elsewhere (e.g. tray Quit).
-func (a *App) requestShutdown() {
+func (a *App) RequestShutdown() {
 	if a.shutdownCh != nil {
 		select {
 		case <-a.shutdownCh:
@@ -345,7 +350,7 @@ func (a *App) handleMessage(m WorkerMsg) {
 		a.applyHotkeyChange(v.Trigger)
 	case Shutdown:
 		a.publish(Update{State: StateIdle, Status: "shutting down"})
-		a.requestShutdown()
+		a.RequestShutdown()
 	default:
 		// unhandled: ignore
 		_ = v
@@ -480,17 +485,29 @@ func (a *App) publishWorking(status string) {
 }
 
 func (a *App) downloadModel() {
-	a.publishWorking("Downloading model: starting…")
+	a.publish(Update{
+		State:       StateTranscribing,
+		Status:      "downloading model…",
+		Downloading: true,
+	})
 	if !a.opts.Headless {
-		a.sendTray(tray.Status{Kind: tray.IconWorking, Title: "gott", Tooltip: "Downloading model"})
+		a.sendTray(tray.Status{Kind: tray.IconWorking, Title: "gostt", Tooltip: "Downloading model"})
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 		err := transcription.DownloadModel(ctx, transcription.ParakeetTDTInt8, func(d, t int64) {
-			a.publishWorking(fmt.Sprintf("Downloading model: %.0f%%", percent(d, t)))
+			pct := percent(d, t)
+			a.publish(Update{
+				State:         StateTranscribing,
+				Status:        fmt.Sprintf("downloading model: %.0f%%", pct),
+				Downloading:   true,
+				DownloadPct:   pct,
+				DownloadBytes: d,
+				DownloadTotal: t,
+			})
 			if t > 0 {
-				a.sendTray(tray.Status{Kind: tray.IconWorking, Title: "gott", Tooltip: fmt.Sprintf("Downloading model %.0f%%", percent(d, t))})
+			a.sendTray(tray.Status{Kind: tray.IconWorking, Title: "gostt", Tooltip: fmt.Sprintf("Downloading model %.0f%%", pct)})
 			}
 		})
 		if err != nil {
@@ -498,7 +515,7 @@ func (a *App) downloadModel() {
 			return
 		}
 		a.publish(Update{State: StateIdle, Status: "model ready", ModelReady: true})
-		a.sendTray(tray.Status{Kind: tray.IconIdle, Title: "gott", Tooltip: "gott — model ready"})
+		a.sendTray(tray.Status{Kind: tray.IconIdle, Title: "gostt", Tooltip: "gostt — model ready"})
 	}()
 }
 
@@ -575,17 +592,17 @@ func (a *App) publish(u Update) {
 	// Bridge to tray as well.
 	switch u.State {
 	case StateIdle:
-		a.sendTray(tray.Status{Kind: tray.IconIdle, Title: "gott", Hotkey: a.Hotkey()})
+		a.sendTray(tray.Status{Kind: tray.IconIdle, Title: "gostt", Hotkey: a.Hotkey()})
 	case StateListening:
-		a.sendTray(tray.Status{Kind: tray.IconIdle, Title: "gott", Hotkey: a.Hotkey(), Tooltip: "listening"})
+		a.sendTray(tray.Status{Kind: tray.IconIdle, Title: "gostt", Hotkey: a.Hotkey(), Tooltip: "listening"})
 	case StateRecording:
-		a.sendTray(tray.Status{Kind: tray.IconRecording, Title: "gott", Hotkey: a.Hotkey(), Tooltip: "recording"})
+		a.sendTray(tray.Status{Kind: tray.IconRecording, Title: "gostt", Hotkey: a.Hotkey(), Tooltip: "recording"})
 	case StateTranscribing:
-		a.sendTray(tray.Status{Kind: tray.IconWorking, Title: "gott", Hotkey: a.Hotkey(), Tooltip: "transcribing"})
+		a.sendTray(tray.Status{Kind: tray.IconWorking, Title: "gostt", Hotkey: a.Hotkey(), Tooltip: "transcribing"})
 	case StateModelMissing:
-		a.sendTray(tray.Status{Kind: tray.IconModelMissing, Title: "gott", Hotkey: a.Hotkey(), Tooltip: "model required"})
+		a.sendTray(tray.Status{Kind: tray.IconModelMissing, Title: "gostt", Hotkey: a.Hotkey(), Tooltip: "model required"})
 	case StateError:
-		a.sendTray(tray.Status{Kind: tray.IconError, Title: "gott", Hotkey: a.Hotkey(), Tooltip: u.Status})
+		a.sendTray(tray.Status{Kind: tray.IconError, Title: "gostt", Hotkey: a.Hotkey(), Tooltip: u.Status})
 	}
 }
 

@@ -1,9 +1,10 @@
 // Package transcription bundles the STT model catalog/downloader and the
 // runtime inference engines. This file holds the catalog metadata and the
-// HTTP downloader used by `gott download`.
+// HTTP downloader used by `gostt download`.
 package transcription
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -24,7 +25,7 @@ type SubFile struct {
 	SizeBytes int64
 }
 
-// ModelInfo describes a single model that gott knows how to use.
+// ModelInfo describes a single model that gostt knows how to use.
 type ModelInfo struct {
 	ID          string // stable key for config.json
 	Name        string // human label for UI
@@ -65,7 +66,7 @@ var ParakeetTDTInt8 = ModelInfo{
 	},
 }
 
-// Models returns every model known to gott.
+// Models returns every model known to gostt.
 func Models() []ModelInfo { return []ModelInfo{ParakeetTDTInt8} }
 
 // FindModel looks up a model by ID. Returns nil if unknown.
@@ -80,16 +81,16 @@ func FindModel(id string) *ModelInfo {
 
 // ModelDir returns the directory a model lives in.
 //
-// Resolves $XDG_DATA_HOME/gott/models/<filename> or, if unset,
-// ~/.local/share/gott/models/<filename>. The directory is created.
+// Resolves $XDG_DATA_HOME/gostt/models/<filename> or, if unset,
+// ~/.local/share/gostt/models/<filename>. The directory is created.
 func ModelDir(m ModelInfo) (string, error) {
 	base, err := os.UserConfigDir() // safer than UserDataDir (linux returns same)
 	var dir string
 	if err == nil {
-		dir = filepath.Join(base, "..", "share", "gott", "models", m.Filename)
+	dir = filepath.Join(base, "..", "share", "gostt", "models", m.Filename)
 	} else {
 		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".local", "share", "gott", "models", m.Filename)
+	dir = filepath.Join(home, ".local", "share", "gostt", "models", m.Filename)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -153,69 +154,157 @@ func DownloadModel(ctx context.Context, m ModelInfo, fn ProgressFn) error {
 	}
 	return nil
 }
-
 // downloadOne streams a single file to <dest>.part then renames it. total
 // returns the size actually downloaded (== Content-Length when known).
+//
+// Improvements over naive io.Copy:
+//   - 1 MiB read buffer (vs 32 KiB) — cuts syscall count ~32× for large files.
+//   - bufio.Writer — batches small writes into larger disk flushes.
+//   - Retry with exponential backoff on transient read errors.
+//   - User-Agent header — some CDNs throttle bare requests.
+//   - HTTP Range resume — picks up from where .part left off when possible.
 func downloadOne(ctx context.Context, sf SubFile, dest string, progress func(d int64)) (io.Closer, int64, error) {
+	const (
+		readBufSize = 1 << 20 // 1 MiB
+		writeBufSize = 1 << 20 // 1 MiB
+		maxRetries   = 5
+		retryBase    = 2 * time.Second
+	)
+
+	part := dest + ".part"
+
+	// Check if we have a partial download to resume from.
+	var resumeOffset int64
+	if fi, err := os.Stat(part); err == nil && fi.Size() > 0 {
+		resumeOffset = fi.Size()
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sf.URL, nil)
 	if err != nil {
 		return nil, 0, err
 	}
+	req.Header.Set("User-Agent", "gostt/1.0 (https://github.com/Guillermode20/gostt)")
+	if resumeOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
+	}
+
 	client := &http.Client{Timeout: 0} // honour ctx instead
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+
+	// Accept 200 (full) or 206 (partial) responses.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return nil, 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	expected := sf.SizeBytes
-	if resp.ContentLength > 0 {
-		expected = resp.ContentLength
+
+	// If server doesn't support resume (returned 200 instead of 206), reset offset.
+	if resp.StatusCode == http.StatusOK {
+		resumeOffset = 0
 	}
-	part := dest + ".part"
-	out, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+
+
+	// Open for append if resuming, truncate if fresh.
+	flags := os.O_CREATE | os.O_WRONLY
+	if resumeOffset == 0 {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_APPEND
+	}
+	out, err := os.OpenFile(part, flags, 0o644)
 	if err != nil {
 		return nil, 0, err
 	}
-	// 32 KiB buffer; smaller would be wasteful, larger wastes memory.
-	buf := make([]byte, 32*1024)
-	var n int64
+
+	var totalRead int64 = resumeOffset
 	last := time.Now()
-	for {
-		nr, rerr := resp.Body.Read(buf)
-		if nr > 0 {
-			if _, werr := out.Write(buf[:nr]); werr != nil {
+
+	// Wrapped in retry loop for transient network errors.
+	for attempt := 0; ; attempt++ {
+		buf := make([]byte, readBufSize)
+		bw := bufio.NewWriterSize(out, writeBufSize)
+
+		for {
+			nr, rerr := resp.Body.Read(buf)
+			if nr > 0 {
+				if _, werr := bw.Write(buf[:nr]); werr != nil {
+					_ = bw.Flush()
+					_ = out.Close()
+					_ = os.Remove(part)
+					return nil, 0, werr
+				}
+				totalRead += int64(nr)
+				if time.Since(last) > 200*time.Millisecond {
+					progress(totalRead)
+					last = time.Now()
+				}
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				_ = bw.Flush()
+				// Retry on transient errors (connection reset, timeout).
+				if attempt < maxRetries && isRetryable(rerr) {
+					_ = resp.Body.Close()
+					wait := retryBase * time.Duration(1<<uint(attempt)) // exponential backoff
+					select {
+					case <-ctx.Done():
+						_ = out.Close()
+						return nil, totalRead, ctx.Err()
+					case <-time.After(wait):
+					}
+					// Re-issue request with updated Range header.
+					req2, err := http.NewRequestWithContext(ctx, http.MethodGet, sf.URL, nil)
+					if err != nil {
+						_ = out.Close()
+						return nil, totalRead, err
+					}
+					req2.Header.Set("User-Agent", "gostt/1.0 (https://github.com/Guillermode20/gostt)")
+					req2.Header.Set("Range", fmt.Sprintf("bytes=%d-", totalRead))
+					resp2, err := client.Do(req2)
+					if err != nil {
+						_ = out.Close()
+						return nil, totalRead, err
+					}
+					resp = resp2
+					continue
+				}
 				_ = out.Close()
 				_ = os.Remove(part)
-				return nil, 0, werr
-			}
-			n += int64(nr)
-			// Throttle progress callbacks to ~5 Hz to keep UI smooth.
-			if time.Since(last) > 200*time.Millisecond {
-				progress(n)
-				last = time.Now()
+				return nil, totalRead, rerr
 			}
 		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			_ = out.Close()
-			_ = os.Remove(part)
-			return nil, n, rerr
-		}
+		_ = bw.Flush()
+		break // success
 	}
-	progress(n)
+
+	progress(totalRead)
 	if err := out.Close(); err != nil {
-		return nil, n, err
+		return nil, totalRead, err
 	}
 	if err := os.Rename(part, dest); err != nil {
-		return nil, n, err
+		return nil, totalRead, err
 	}
-	_ = expected // used implicitly via sf.SizeBytes check in caller
-	return nil, n, nil
+	return nil, totalRead, nil
+}
+
+// isRetryable reports whether err is likely transient and worth retrying.
+func isRetryable(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr interface{ Timeout() bool }
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// "connection reset by peer" and similar
+	s := err.Error()
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "unexpected EOF")
 }
 
 // LoadVocab reads a vocab.txt file (one token per line) into a slice. The

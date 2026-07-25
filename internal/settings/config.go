@@ -1,5 +1,5 @@
 // Package settings loads and persists user configuration to the XDG config
-// directory (~/.config/gott/config.json).
+// directory (~/.config/gostt/config.json).
 //
 // The package is intentionally small and dependency-free so it can be used
 // safely from any layer (CLI, GUI, worker goroutines) without taking locks.
@@ -78,7 +78,7 @@ func ConfigPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cfgDir := filepath.Join(dir, "gott")
+	cfgDir := filepath.Join(dir, "gostt")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		return "", err
 	}

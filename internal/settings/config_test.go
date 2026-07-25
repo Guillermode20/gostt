@@ -57,7 +57,7 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 func TestLoadLegacyAutoPaste(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
-	cfgDir := filepath.Join(tmp, "gott")
+	cfgDir := filepath.Join(tmp, "gostt")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

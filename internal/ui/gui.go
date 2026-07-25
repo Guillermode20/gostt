@@ -1,6 +1,5 @@
 // Package ui wraps the Fyne v2 GUI around the orchestrator's Update
-// channel. Every UI binding is read from the orchestrator on the Fyne
-// goroutine via fyne.Do; writes back from widgets (e.g., hotkey changes)
+// channel. Writes back from widgets (e.g., hotkey changes)
 // go through the orchestrator's WorkerMsg channel.
 package ui
 
@@ -8,65 +7,56 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
+	fyneApp "fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 
-	"github.com/gott/gott/internal/app"
-	"github.com/gott/gott/internal/audio"
-	"github.com/gott/gott/internal/clipboard"
-	"github.com/gott/gott/internal/settings"
+	gottApp "github.com/Guillermode20/gostt/internal/app"
+	"github.com/Guillermode20/gostt/internal/audio"
+	"github.com/Guillermode20/gostt/internal/clipboard"
+	"github.com/Guillermode20/gostt/internal/settings"
 )
 
 // Callbacks lets the GUI send messages back to the orchestrator's worker.
 type Callbacks struct {
-	OnStart       func(deviceName string)
-	OnStop        func()
-	OnDownload    func()
-	OnCopy        func()
-	OnClear       func()
+	OnStart        func(deviceName string)
+	OnStop         func()
+	OnDownload     func()
+	OnCopy         func()
+	OnClear        func()
 	OnSaveSettings func(s settings.Settings)
-	OnUnselectMic func()
-	OnQuit        func()
+	OnUnselectMic  func()
+	OnQuit         func()
 }
 
-// State holds every reactive binding the GUI reads from. The orchestrator
-// updates these via Fyne's data binding API (which marshals to the main
-// goroutine).
+// State holds every reactive binding the GUI reads from.
 type State struct {
 	Status        binding.String
 	InputLevel    binding.Float
+	Transcription binding.String
 	ModelReady    binding.Bool
 	Hotkey        binding.String
 	Threads       binding.Int
 	AutoType      binding.Bool
-	Transcription binding.String
-	MicOptions    binding.StringList
 	SelectedMic   binding.String
 	ModelID       binding.String
 	IsRecording   binding.Bool
 }
 
-// NewState returns a State with sensible defaults so the GUI can be shown
-// before the orchestrator has fully come up.
 func NewState() *State {
-	list := binding.NewStringList()
 	return &State{
 		Status:        binding.NewString(),
 		InputLevel:    binding.NewFloat(),
+		Transcription: binding.NewString(),
 		ModelReady:    binding.NewBool(),
 		Hotkey:        binding.NewString(),
 		Threads:       binding.NewInt(),
 		AutoType:      binding.NewBool(),
-		Transcription: binding.NewString(),
-		MicOptions:    list,
 		SelectedMic:   binding.NewString(),
 		ModelID:       binding.NewString(),
 		IsRecording:   binding.NewBool(),
@@ -75,9 +65,9 @@ func NewState() *State {
 
 // Window ties together the Fyne widgets.
 type Window struct {
-	a *app.App
+	a       *gottApp.App
 	fyneApp fyne.App
-	w fyne.Window
+	w       fyne.Window
 
 	state *State
 	cb    *Callbacks
@@ -88,40 +78,41 @@ type Window struct {
 	clearBtn      *widget.Button
 	micSelect     *widget.Select
 	levelBar      *widget.ProgressBar
-	transcript    *widget.Entry
+	dlBar         *widget.ProgressBar
+	dlLabel       *widget.Label
+	dlSection     *fyne.Container
+	transcript    *widget.Label
 	statusLabel   *widget.Label
 	hotkeyEntry   *widget.Entry
 	threadsEntry  *widget.Entry
 	autoTypeCheck *widget.Check
-	helpLabel     *widget.Label
 	settingsBox   *fyne.Container
 
-	// hide-on-close pattern keeps the process alive when the user Xes out.
-	wantsQuit bool
-
+	wantsQuit  bool
 	pollerStop chan struct{}
 }
 
-// RunWindow blocks until the user quits via tray/menu/file picker. It
-// spawns a single update-polling goroutine and tears everything down on
-// exit.
-func RunWindow(a *app.App, state *State, cb *Callbacks, title string) error {
+// RunWindow blocks until the user quits.
+func RunWindow(a *gottApp.App, state *State, cb *Callbacks, title string) error {
 	w := &Window{
-		a:         a,
-		fyneApp:   app.New(),
-		state:     state,
-		cb:        cb,
+		a:          a,
+		fyneApp:    fyneApp.NewWithID("io.github.guillermode20.gostt"),
+		state:      state,
+		cb:         cb,
 		pollerStop: make(chan struct{}),
 	}
-	// Fyne defaults to its built-in dark theme; no SetTheme call needed.
+
+	// Apply dark monospace theme.
+	w.fyneApp.Settings().SetTheme(NewDarkMonospace())
+
 	w.w = w.fyneApp.NewWindow(title)
-	w.w.Resize(fyne.NewSize(820, 640))
+	w.w.Resize(fyne.NewSize(560, 480))
+	w.w.SetPadded(false)
 	w.w.SetCloseIntercept(func() { w.w.Hide() })
 
 	w.buildUI()
 	w.attachBindings()
 
-	// Seed initial values from current settings.
 	if cfg, err := settings.Load(); err == nil {
 		_ = state.Hotkey.Set(cfg.HoldToTalkKey)
 		_ = state.Threads.Set(cfg.Threads)
@@ -139,77 +130,111 @@ func RunWindow(a *app.App, state *State, cb *Callbacks, title string) error {
 	return nil
 }
 
+// thinSep returns a minimal horizontal separator.
+func thinSep() *widget.Separator {
+	return widget.NewSeparator()
+}
+
 func (w *Window) buildUI() {
-	// Status bar
+	// ── Status line ───────────────────────────────────────
 	w.statusLabel = widget.NewLabel("starting…")
 	w.statusLabel.Wrapping = fyne.TextWrapWord
-	w.helpLabel = widget.NewLabel("Hold Ctrl+Space to record, or click ● Record.")
-	w.helpLabel.Wrapping = fyne.TextWrapWord
 
-	statusBar := container.NewVBox(w.statusLabel, w.helpLabel)
-
-	// Microphone row
+	// ── Mic row ───────────────────────────────────────────
 	w.micSelect = widget.NewSelect([]string{}, func(name string) {
-		w.cb.OnClear() // clear previous transcript on device change
-		w.cb.OnSaveSettings
-		// The actual recording start is triggered by the record button.
+		if w.cb != nil && w.cb.OnClear != nil {
+			w.cb.OnClear()
+		}
 	})
-	w.micSelect.PlaceHolder = "(select a microphone)"
+	w.micSelect.PlaceHolder = "mic"
 	refreshBtn := widget.NewButton("↻", func() {
-		// Re-enumerate by asking orchestrator to re-scan.
-		w.cb.OnClear()
-		w.cb.OnUnselectMic()
+		if w.cb != nil && w.cb.OnClear != nil {
+			w.cb.OnClear()
+		}
+		if w.cb != nil && w.cb.OnUnselectMic != nil {
+			w.cb.OnUnselectMic()
+		}
 	})
-	micRow := container.NewBorder(nil, nil, widget.NewLabel("Mic:"), refreshBtn, w.micSelect)
+	refreshBtn.Importance = widget.LowImportance
+	micRow := container.NewBorder(nil, nil, nil, refreshBtn, w.micSelect)
 
-	// Level bar + record button
+	// ── Level bar ─────────────────────────────────────────
 	w.levelBar = widget.NewProgressBar()
 	w.levelBar.Min = 0
 	w.levelBar.Max = 1
 
-	w.recBtn = widget.NewButton("● Record", func() {
-		w.toggleRecord()
-	})
+	// ── Record button ─────────────────────────────────────
+	w.recBtn = widget.NewButton("● RECORD", func() { w.toggleRecord() })
 	w.recBtn.Importance = widget.HighImportance
 
-	w.dlBtn = widget.NewButton("Download Model", func() {
-		w.cb.OnDownload()
-	})
-	w.dlBtn.Disable()
+	// ── Download section ──────────────────────────────────
+	w.dlBar = widget.NewProgressBar()
+	w.dlBar.Min = 0
+	w.dlBar.Max = 1
+	w.dlBar.SetValue(0)
 
+	w.dlLabel = widget.NewLabel("")
+
+	w.dlBtn = widget.NewButton("Download Model", func() {
+		if w.cb != nil && w.cb.OnDownload != nil {
+			w.cb.OnDownload()
+		}
+	})
+
+	dlInfo := container.NewBorder(nil, nil, nil, w.dlLabel, w.dlBar)
+	w.dlSection = container.NewBorder(nil, nil, nil, w.dlBtn, dlInfo)
+
+	// Initially show download button, hide progress bar.
+	w.dlBtn.Show()
+
+	// ── Transcript ────────────────────────────────────────
+	w.transcript = widget.NewLabel("")
+	w.transcript.Wrapping = fyne.TextWrapWord
+	w.transcript.TextStyle = fyne.TextStyle{Monospace: true}
+
+	// ── Copy / Clear row ──────────────────────────────────
 	w.copyBtn = widget.NewButton("Copy", func() {
 		s, _ := w.state.Transcription.Get()
 		if s == "" {
 			return
 		}
 		_ = clipboard.Write(s)
-		fyne.Do(func() {
-			w.setStatus("copied to clipboard")
-		})
+		w.setStatus("copied")
 	})
 	w.clearBtn = widget.NewButton("Clear", func() {
-		w.cb.OnClear()
+		if w.cb != nil && w.cb.OnClear != nil {
+			w.cb.OnClear()
+		}
+		w.transcript.SetText("")
 	})
 
-	w.transcript = widget.NewMultiLineEntry()
-	w.transcript.SetPlaceHolder("Transcription will appear here…")
-	w.transcript.Disable()
-
-	w.copyClearRow := container.NewHBox(w.copyBtn, w.clearBtn, layout.NewSpacer())
-
-	topHalf := container.NewVBox(
-		statusBar,
-		micRow,
-		container.NewBorder(nil, nil, nil, w.dlBtn, container.NewBorder(nil, nil, widget.NewLabel("Level"), w.recBtn, w.levelBar)),
-		w.copyClearRow,
-		w.transcript,
-	)
-
-	// Settings panel
+	// ── Settings (collapsed) ──────────────────────────────
 	w.buildSettingsPanel()
 
-	// Final layout
-	content := container.NewBorder(nil, w.settingsBox, nil, nil, topHalf)
+	// ── Compose layout ────────────────────────────────────
+	topSection := container.NewVBox(
+		w.statusLabel,
+		micRow,
+		w.recBtn,
+		w.dlSection,
+		container.NewPadded(w.levelBar),
+		thinSep(),
+	)
+
+	scrollTranscript := container.NewVScroll(w.transcript)
+
+	actionRow := container.NewHBox(w.copyBtn, w.clearBtn)
+
+	content := container.NewBorder(
+		topSection,          // top
+		container.NewVBox(   // bottom
+			thinSep(),
+			actionRow,
+			w.settingsBox,
+		),                  // bottom
+		nil, nil,            // left, right
+		scrollTranscript,   // center
+	)
 	w.w.SetContent(content)
 }
 
@@ -233,7 +258,7 @@ func (w *Window) buildSettingsPanel() {
 		var n int
 		_, err := fmt.Sscanf(s, "%d", &n)
 		if err != nil || n < 1 || n > 8 {
-			return fmt.Errorf("threads must be 1..8")
+			return fmt.Errorf("1..8")
 		}
 		return nil
 	}
@@ -243,19 +268,20 @@ func (w *Window) buildSettingsPanel() {
 		_ = w.state.Threads.Set(n)
 	}
 
-	w.autoTypeCheck = widget.NewCheck("Auto-type into active window", func(on bool) {
+	w.autoTypeCheck = widget.NewCheck("auto-type", func(on bool) {
 		_ = w.state.AutoType.Set(on)
 	})
 
+	saveBtn := widget.NewButton("Save", w.saveSettings)
+	saveBtn.Importance = widget.LowImportance
+
 	settingsForm := container.NewVBox(
-		widget.NewLabel("Hotkey (e.g. ctrl+space, alt+space, f9):"),
-		w.hotkeyEntry,
-		widget.NewLabel("Threads (1..8):"),
-		w.threadsEntry,
+		container.NewHBox(widget.NewLabel("hotkey:"), w.hotkeyEntry),
+		container.NewHBox(widget.NewLabel("threads:"), w.threadsEntry),
 		w.autoTypeCheck,
-		widget.NewButton("Save Settings", w.saveSettings),
+		saveBtn,
 	)
-	settingsItem := widget.NewAccordionItem("Settings (click to expand)", settingsForm)
+	settingsItem := widget.NewAccordionItem("settings", settingsForm)
 	w.settingsBox = container.NewVBox(widget.NewAccordion(settingsItem))
 }
 
@@ -272,29 +298,24 @@ func (w *Window) saveSettings() {
 	}
 	cfg.AutoType = at
 	if err := settings.Save(cfg); err != nil {
-		dialog.ShowError(err, w.w)
+		fyne.Do(func() { dialog.ShowError(err, w.w) })
 		return
 	}
-	if w.cb.OnSaveSettings != nil {
+	if w.cb != nil && w.cb.OnSaveSettings != nil {
 		w.cb.OnSaveSettings(cfg)
 	}
-	w.setStatus("settings saved")
+	fyne.Do(func() { w.setStatus("settings saved") })
 }
 
-// attachBindings reads from the orchestrator's update channel and applies
-// those to widgets on the Fyne goroutine via fyne.Do.
 func (w *Window) attachBindings() {
 	ch := w.a.UpdateChannel()
 
 	go func() {
 		for u := range ch {
-			fyne.Do(func() {
-				w.apply(u)
-			})
+			w.apply(u)
 		}
 	}()
 
-	// Initial mic population.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -306,43 +327,68 @@ func (w *Window) attachBindings() {
 	}()
 }
 
-func (w *Window) apply(u app.Update) {
+func (w *Window) apply(u gottApp.Update) {
 	if u.Status != "" {
-		w.setStatus(u.Status)
+		fyne.Do(func() { w.setStatus(u.Status) })
 	}
 	if u.InputLevel >= 0 {
 		_ = w.state.InputLevel.Set(float64(u.InputLevel))
-		w.levelBar.SetValue(float64(u.InputLevel))
+		fyne.Do(func() { w.levelBar.SetValue(float64(u.InputLevel)) })
 	}
 	if u.Transcription != "" {
 		_ = w.state.Transcription.Set(u.Transcription)
-		w.transcript.SetText(u.Transcription)
+		fyne.Do(func() { w.transcript.SetText(u.Transcription) })
 	}
-	if !u.ModelReady {
-		_ = w.state.ModelReady.Set(false)
-		w.dlBtn.Enable()
-	} else {
+
+	// Download progress.
+	if u.Downloading {
+		fyne.Do(func() {
+			w.dlBtn.Hide()
+			w.dlBar.Show()
+			w.dlBar.SetValue(u.DownloadPct / 100.0)
+			if u.DownloadTotal > 0 {
+				w.dlLabel.SetText(fmt.Sprintf("%.0f%%  %.1f / %.1f MB",
+					u.DownloadPct,
+					float64(u.DownloadBytes)/1048576,
+					float64(u.DownloadTotal)/1048576))
+			} else {
+				w.dlLabel.SetText(fmt.Sprintf("%.0f%%", u.DownloadPct))
+			}
+		})
+	}
+
+	if u.ModelReady {
 		_ = w.state.ModelReady.Set(true)
-		w.dlBtn.Disable()
+		fyne.Do(func() {
+			w.dlBtn.Hide()
+			w.dlBar.SetValue(1)
+			w.dlLabel.SetText("ready")
+		})
+	} else if !u.Downloading && u.State == gottApp.StateModelMissing {
+		_ = w.state.ModelReady.Set(false)
+		fyne.Do(func() {
+			w.dlBtn.Show()
+			w.dlBar.Hide()
+			w.dlLabel.SetText("")
+		})
 	}
+
 	switch u.State {
-	case app.StateRecording:
-		w.recBtn.SetText("■ Stop")
+	case gottApp.StateRecording:
+		fyne.Do(func() { w.recBtn.SetText("■ STOP") })
 		_ = w.state.IsRecording.Set(true)
-	case app.StateIdle, app.StateListening, app.StateError, app.StateModelMissing, app.StateTranscribing:
-		w.recBtn.SetText("● Record")
+	case gottApp.StateIdle, gottApp.StateListening, gottApp.StateError, gottApp.StateModelMissing, gottApp.StateTranscribing:
+		fyne.Do(func() { w.recBtn.SetText("● RECORD") })
 		_ = w.state.IsRecording.Set(false)
 	}
 	if u.Hotkey != "" {
 		_ = w.state.Hotkey.Set(u.Hotkey)
+		fyne.Do(func() { w.hotkeyEntry.SetText(u.Hotkey) })
 	}
 }
 
-// setStatus updates the status banner.
 func (w *Window) setStatus(s string) { w.statusLabel.SetText(s) }
 
-// pollUpdates periodically reconciles widgets from the binding API in case
-// a state missed the wakeup tick.
 func (w *Window) pollUpdates() {
 	t := time.NewTicker(120 * time.Millisecond)
 	defer t.Stop()
@@ -358,26 +404,26 @@ func (w *Window) pollUpdates() {
 	}
 }
 
-// toggleRecord is the button click handler. It reflects the IsRecording
-// binding so double-clicks don't cause double-starts.
 func (w *Window) toggleRecord() {
 	rec, _ := w.state.IsRecording.Get()
 	if rec {
-		w.cb.OnStop()
+		if w.cb != nil && w.cb.OnStop != nil {
+			w.cb.OnStop()
+		}
 		return
 	}
 	sel, _ := w.state.SelectedMic.Get()
-	if w.cb.OnStart != nil {
+	if w.cb != nil && w.cb.OnStart != nil {
 		w.cb.OnStart(sel)
 	}
 }
 
 func (w *Window) populateMics(mics []audio.MicInfo) {
+	names := make([]string, 0, len(mics))
+	for _, m := range mics {
+		names = append(names, m.Name)
+	}
 	fyne.Do(func() {
-		names := make([]string, 0, len(mics))
-		for _, m := range mics {
-			names = append(names, m.Name)
-		}
 		w.micSelect.Options = names
 		if len(names) > 0 {
 			w.micSelect.SetSelected(names[0])
@@ -385,11 +431,6 @@ func (w *Window) populateMics(mics []audio.MicInfo) {
 	})
 }
 
-// Hide hides the window; the orchestrator keeps running so user can still
-// use the global hotkey.
 func (w *Window) Hide() { w.w.Hide() }
 
-// Quit cleanly terminates the Fyne loop.
 func (w *Window) Quit() { w.fyneApp.Quit() }
-
-// (no stray locks; sync package is no longer needed here)

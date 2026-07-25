@@ -1,13 +1,13 @@
-// Command gott is the CLI / GUI entrypoint for the offline speech-to-text
+// Command gostt is the CLI / GUI entrypoint for the offline speech-to-text
 // dictation app.
 //
 // Usage:
 //
-//	gott                       launch GUI + system tray (default)
-//	gott list                  list available microphones
-//	gott download              download the default model (~670 MB)
-//	gott record [seconds]      record N seconds and print transcription
-//	gott --help                this help
+//	gostt                       launch GUI + system tray (default)
+//	gostt list                  list available microphones
+//	gostt download              download the default model (~670 MB)
+//	gostt record [seconds]      record N seconds and print transcription
+//	gostt --help                this help
 package main
 
 import (
@@ -20,25 +20,25 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gott/gott/internal/app"
-	"github.com/gott/gott/internal/audio"
-	"github.com/gott/gott/internal/settings"
-	"github.com/gott/gott/internal/transcription"
-	"github.com/gott/gott/internal/ui"
+	"github.com/Guillermode20/gostt/internal/app"
+	"github.com/Guillermode20/gostt/internal/audio"
+	"github.com/Guillermode20/gostt/internal/settings"
+	"github.com/Guillermode20/gostt/internal/transcription"
+	"github.com/Guillermode20/gostt/internal/ui"
 )
 
-const usage = `gott — offline speech-to-text for Linux
+const usage = `gostt — offline speech-to-text for Linux
 
 USAGE:
-  gott                       launch GUI + system tray
-  gott list                  enumerate microphones
-  gott download              fetch the default Parakeet-TDT model
-  gott record [SECONDS]      record N seconds (default 5) and transcribe
-  gott --help, -h            print this message
+  gostt                       launch GUI + system tray
+  gostt list                  enumerate microphones
+  gostt download              fetch the default Parakeet-TDT model
+  gostt record [SECONDS]      record N seconds (default 5) and transcribe
+  gostt --help, -h            print this message
 
 ENVIRONMENT:
-  GOTT_ORT_LIB               path to libonnxruntime.so (default: libonnxruntime.so)
-  GOTT_TDT_*                 override ONNX tensor names for non-standard exports
+  GOSTT_ORT_LIB               path to libonnxruntime.so (default: libonnxruntime.so)
+  GOSTT_TDT_*                 override ONNX tensor names for non-standard exports
   XDG_SESSION_TYPE           detected automatically; controls input backend choice
 `
 
@@ -82,7 +82,7 @@ func main() {
 }
 
 func fail(err error) {
-	fmt.Fprintf(os.Stderr, "gott: %v\n", err)
+	fmt.Fprintf(os.Stderr, "gostt: %v\n", err)
 	os.Exit(1)
 }
 
@@ -99,8 +99,8 @@ func runGUI() error {
 	}()
 
 	a, err := app.New(app.Options{
-		AppID: "io.github.gott.gott",
-		Title: "gott STT",
+		AppID: "io.github.guillermode20.gostt",
+		Title: "gostt STT",
 	})
 	if err != nil {
 		return err
@@ -130,13 +130,13 @@ func runGUI() error {
 		func() { a.Send(app.Shutdown{}) },
 	)
 	_ = cb
-	if err := ui.RunWindow(a, state, cb, "gott STT"); err != nil {
+	if err := ui.RunWindow(a, state, cb, "gostt STT"); err != nil {
 		return err
 	}
 	select {
 	case <-a.ShutdownChannel():
 	default:
-		a.requestShutdown()
+		a.RequestShutdown()
 	}
 	_ = a.Shutdown(2 * time.Second)
 	return nil
@@ -213,7 +213,7 @@ func runRecord(seconds float64) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("model not installed; run `gott download` first")
+		return fmt.Errorf("model not installed; run `gostt download` first")
 	}
 	eng, err := transcription.NewEngine(m, transcription.EngineConfig{
 		Threads: min(runtime.NumCPU(), 4),

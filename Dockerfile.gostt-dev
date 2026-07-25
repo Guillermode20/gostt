@@ -1,13 +1,13 @@
-# Dockerfile.gott-dev — alternative to distrobox.ini for vanilla Docker
+# Dockerfile.gostt-dev — alternative to distrobox.ini for vanilla Docker
 # environments. Build with:
 #
-#   docker build -f Dockerfile.gott-dev -t gott-dev .
+#   docker build -f Dockerfile.gostt-dev -t gostt-dev .
 #   docker run -it --rm \
 #       --device /dev/snd --device /dev/uinput \
 #       --group-add audio --group-add input \
-#       -v "$PWD":/go/src/github.com/gott/gott \
-#       -w /go/src/github.com/gott/gott \
-#       gott-dev bash
+#       -v "$PWD":/go/src/github.com/Guillermode20/gostt \
+#       -w /go/src/github.com/Guillermode20/gostt \
+#       gostt-dev bash
 #
 # Multi-arch note: TARGETARCH comes from `docker buildx build`. The
 # Go tarball and ONNX runtime URLs vary by arch; we expand them below.
@@ -60,12 +60,12 @@ RUN set -eux; \
     ln -sf "${ORT_DIR}/lib/libonnxruntime.so" /usr/local/lib/libonnxruntime.so; \
     ldconfig; \
     rm -f /tmp/onnxruntime.tgz; \
-    echo "LD_LIBRARY_PATH=${ORT_DIR}/lib:${LD_LIBRARY_PATH}" > /etc/profile.d/gott-ort.sh
+    echo "LD_LIBRARY_PATH=${ORT_DIR}/lib:${LD_LIBRARY_PATH}" > /etc/profile.d/gostt-ort.sh
 
 # Working dir + non-root user so `go build` doesn't need --privileged.
-WORKDIR /go/src/github.com/gott/gott
-RUN groupadd -g 1000 gott && useradd -m -u 1000 -g gott gott && \
-    chown -R gott:gott /go
-USER gott
+WORKDIR /go/src/github.com/Guillermode20/gostt
+RUN groupadd -g 1000 gostt && useradd -m -u 1000 -g gostt gostt && \
+    chown -R gostt:gostt /go
+USER gostt
 
 CMD ["/bin/bash"]

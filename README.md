@@ -1,4 +1,4 @@
-# gott — Offline Linux Speech-to-Text Dictation (Go)
+# gostt — Offline Linux Speech-to-Text Dictation (Go)
 
 A Go port of the `rustt` project: a privacy-focused, offline hold-to-talk STT dictation
 application for Linux desktops.
@@ -22,7 +22,7 @@ application for Linux desktops.
 ## Project Layout
 
 ```
-cmd/gott/main.go             — CLI entrypoint
+cmd/gostt/main.go             — CLI entrypoint
 internal/app/app.go          — orchestrator: channels, worker loop, glue
 internal/audio/capture.go    — mic enumeration + recording via malgo
 internal/audio/resample.go   — mono downmix, 16 kHz resample, silence trim
@@ -31,19 +31,19 @@ internal/transcription/engine.go    — Parakeet-TDT ONNX inference loop
 internal/hotkey/portal.go    — XDG GlobalShortcuts Portal (godbus)
 internal/tray/tray.go        — systray menu + dynamic icons
 internal/inputsim/typing.go  — auto-typing via robotgo/xdotool/wtype/uinput
-internal/settings/config.go  — XDG config (~/.config/gott/config.json)
+internal/settings/config.go  — XDG config (~/.config/gostt/config.json)
 internal/ui/gui.go           — Fyne window, controls, level bar
 ```
 
 ## Build & Run
 
 The fastest reproduction path uses a [distrobox](https://distrobox.org/)
-dev container — Ubuntu 24.04 with all gott's system libs, ONNX Runtime,
+dev container — Ubuntu 24.04 with all gostt's system libs, ONNX Runtime,
 Go 1.23 and the project mounted in. Two manifest formats are shipped:
 
-- `distrobox.ini` — declarative multi-target manifest; the `[target.gott-dev]`
+- `distrobox.ini` — declarative multi-target manifest; the `[target.gostt-dev]`
   stanza is the developer image.
-- `Dockerfile.gott-dev` — same image as a vanilla `docker build` target.
+- `Dockerfile.gostt-dev` — same image as a vanilla `docker build` target.
 
 ### Option A — distrobox (recommended)
 
@@ -59,23 +59,23 @@ Inside the box:
 
 ```bash
 go mod tidy
-go build -o gott ./cmd/gott
-./gott list
-./gott download          # ~670 MB on first run
-./gott record 5          # 5 seconds on the system default mic
-# or just `gott` for the GUI + tray
+go build -o gostt ./cmd/gostt
+./gostt list
+./gostt download          # ~670 MB on first run
+./gostt record 5          # 5 seconds on the system default mic
+# or just `gostt` for the GUI + tray
 ```
 
 ### Option B — vanilla Docker
 
 ```bash
-docker build -f Dockerfile.gott-dev -t gott-dev .
+docker build -f Dockerfile.gostt-dev -t gostt-dev .
 docker run -it --rm \
     --device /dev/snd --device /dev/uinput \
     --group-add audio --group-add input \
-    -v "$PWD":/go/src/github.com/gott/gott \
+    -v "$PWD":/go/src/github.com/Guillermode20/gostt \
     -e LD_LIBRARY_PATH=/opt/onnxruntime-linux-x64-1.18.0/lib \
-    gott-dev bash
+    gostt-dev bash
 ```
 
 ### Option C — bare-metal Debian/Ubuntu
@@ -107,21 +107,21 @@ export LD_LIBRARY_PATH=/opt/onnxruntime-linux-x64-1.18.0/lib:$LD_LIBRARY_PATH
 
 ```bash
 go mod tidy
-go build -o gott ./cmd/gott
+go build -o gostt ./cmd/gostt
 ```
 
 ### Usage
 
 ```bash
-gott                       # launch GUI + tray
-gott list                  # print available microphones
-gott download              # download the default Parakeet-TDT INT8 model
-gott record [seconds]      # record N seconds and print transcription + timings
-gott --help                # usage info
+gostt                       # launch GUI + tray
+gostt list                  # print available microphones
+gostt download              # download the default Parakeet-TDT INT8 model
+gostt record [seconds]      # record N seconds and print transcription + timings
+gostt --help                # usage info
 ```
 
-The model is stored in `~/.local/share/gott/models/parakeet-tdt-int8/`. Config lives
-in `~/.config/gott/config.json`.
+The model is stored in `~/.local/share/gostt/models/parakeet-tdt-int8/`. Config lives
+in `~/.config/gostt/config.json`.
 
 ## Hotkey
 
@@ -139,7 +139,7 @@ The Parakeet-TDT runtime is implemented around:
    length reached).
 4. Token-text mapping via `vocab.txt`.
 
-The implementation makes assumptions about the model’s I/O names (commonly
+The implementation makes assumptions about the model's I/O names (commonly
 `audio_signal`, `targets`, `target_length` on older NeMo exports, or `input_signal`
 on newer ones) — see `internal/transcription/engine.go` for the exact names and how
-to override them via environment variable `GOTT_TDT_INPUT_NAME` etc.
+to override them via environment variable `GOSTT_TDT_INPUT_NAME` etc.

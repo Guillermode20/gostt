@@ -1,5 +1,5 @@
 // Package clipboard is a tiny wrapper around atotto/clipboard that gives
-// the rest of gott a single import line for both Linux and other platforms
+// the rest of gostt a single import line for both Linux and other platforms
 // in future. It also ensures errors carry useful context.
 package clipboard
 

@@ -2,8 +2,8 @@
 //
 // The tray is a long-running object that:
 //
-//   - displays the application title (mutated to reflect state: "gott",
-//     "gott ● Rec", "gott … Transcribing", etc.)
+//   - displays the application title (mutated to reflect state: "gostt",
+//     "gostt ● Rec", "gostt … Transcribing", etc.)
 //   - exposes a context menu with: status, hotkey, toggle, quit
 //   - forwards Status updates from the orchestrator to the underlying
 //     notification item (only ASCII-friendly runes are used so we don't

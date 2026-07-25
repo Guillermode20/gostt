@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	clipboardx "github.com/gott/gott/internal/clipboard"
+	clipboardx "github.com/Guillermode20/gostt/internal/clipboard"
 
 	"github.com/bendahl/uinput"
 )
@@ -205,7 +205,7 @@ type UinputTyper struct {
 // Caller must Close() it.
 func NewUinput() (*UinputTyper, error) {
 	t := &UinputTyper{}
-	k, err := uinput.CreateKeyboard("/dev/uinput", []byte("gott-virtual-keyboard"))
+	k, err := uinput.CreateKeyboard("/dev/uinput", []byte("gostt-virtual-keyboard"))
 	if err != nil {
 		return nil, fmt.Errorf("create uinput keyboard (need /dev/uinput RW access): %w", err)
 	}

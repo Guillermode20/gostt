@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/dev-shell.sh
 #
-# One-line wrapper for entering the gott dev distrobox with all the
+# One-line wrapper for entering the gostt dev distrobox with all the
 # recommended flags already set (audio passthrough, ONNX runtime libs,
 # GOPATH bind-mount).
 #
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-NAME="${GOTT_BOX_NAME:-gott-dev}"
+NAME="${GOSTT_BOX_NAME:-gostt-dev}"
 ORT_VER="${ORT_VER:-1.18.0}"
 ORT_DIR="/opt/onnxruntime-linux-x64-${ORT_VER}"
 
@@ -28,7 +28,7 @@ run_in_box() {
     # is reachable for any go-built binary.
     local -a env_args=(
       --env="CGO_ENABLED=1"
-      --env="GOTT_ORT_LIB=${ORT_DIR}/lib/libonnxruntime.so"
+      --env="GOSTT_ORT_LIB=${ORT_DIR}/lib/libonnxruntime.so"
       --env="LD_LIBRARY_PATH=${ORT_DIR}/lib:${LD_LIBRARY_PATH:-}"
     )
 
@@ -36,22 +36,15 @@ run_in_box() {
         exec distrobox enter "${NAME}" -- "${EXTRA_FLAGS[@]}" "${env_args[@]}"
     fi
 
-    # Build the command string WITHOUT losing per-arg quoting. bash-5+
-    # supports the `${array[*]@Q}` operator that emits each element
-    # quoted exactly as it would appear at command-parse time. Fall back
-    # to a manual escape on older bash.
+    # Build a SINGLE correctly-quoted command string, then hand it to
+    # `bash -lc` as one argument. The naive `${*@Q}` emission produces
+    # one quoted token per arg, which `bash -lc` mistakenly interprets
+    # as positional args ($0, $1, …) instead of one shell snippet.
+    # `printf '%q'` emits each arg shell-escaped AND joined with
+    # spaces in a single value that's safe to feed to `bash -lc` again.
     local cmd
-    if ((BASH_VERSINFO[0] >= 5)); then
-        cmd="${*@Q}"
-    else
-        # Manual escape for bash 4.x.
-        local esc=()
-        local a
-        for a in "$@"; do
-            esc+=("$(printf '%s' "$a" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/")")
-        done
-        cmd="${esc[*]}"
-    fi
+    printf -v cmd '%q ' "$@"
+    cmd="${cmd% }"  # strip trailing space
     exec distrobox enter "${NAME}" -- \
         "${EXTRA_FLAGS[@]}" "${env_args[@]}" \
         bash -lc "$cmd"

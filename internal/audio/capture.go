@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,9 +41,25 @@ func ListMicrophones() ([]MicInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("enumerate capture devices: %w", err)
 	}
-	// In v0.11.25, the first entry in Devices() is the system default.
+	
 	var defaultName string
-	if len(devices) > 0 {
+	for _, d := range devices {
+		name := d.Name()
+		if d.IsDefault != 0 && !strings.HasPrefix(name, "Monitor of ") {
+			defaultName = name
+			break
+		}
+	}
+	if defaultName == "" {
+		for _, d := range devices {
+			name := d.Name()
+			if !strings.HasPrefix(name, "Monitor of ") {
+				defaultName = name
+				break
+			}
+		}
+	}
+	if defaultName == "" && len(devices) > 0 {
 		defaultName = devices[0].Name()
 	}
 
@@ -114,26 +131,30 @@ func NewStream(deviceName string, dataCB func([]float32), levelCB func(float32))
 			_ = malCtx.Uninit()
 			return nil, fmt.Errorf("enumerate capture devices: %w", derr)
 		}
-		var found malgo.DeviceInfo
-		foundMatch := false
-		for _, d := range devices {
-			if d.Name() == deviceName {
-				found = d
-				foundMatch = true
+		var targetID *malgo.DeviceID
+		for i := range devices {
+			if devices[i].Name() == deviceName {
+				targetID = &devices[i].ID
 				break
 			}
 		}
-		if !foundMatch {
+		if targetID == nil {
 			_ = malCtx.Uninit()
 			return nil, fmt.Errorf("microphone not found: %s", deviceName)
 		}
-		// In malgo v0.11.25, DeviceID is an internal unsafe.Pointer-style
-		// type that isn't assignable into the DeviceConfig struct from
-		// user code in all backends. We record the desired name; if the
-		// backend supports per-name selection at OpenStream time the
-		// implementation below can use it, otherwise the miniaudio default
-		// (system-wide default capture) is used.
-		_ = found
+		cfg.Capture.DeviceID = targetID.Pointer()
+	} else {
+		// Auto-select the first non-monitor input device
+		devices, derr := malCtx.Devices(malgo.Capture)
+		if derr == nil {
+			for i := range devices {
+				name := devices[i].Name()
+				if !strings.HasPrefix(name, "Monitor of ") {
+					cfg.Capture.DeviceID = devices[i].ID.Pointer()
+					break
+				}
+			}
+		}
 	}
 
 	s := &Stream{
@@ -142,11 +163,10 @@ func NewStream(deviceName string, dataCB func([]float32), levelCB func(float32))
 		// Re-query effective sample rate below once the device is opened.
 	}
 
-	// Capture callback runs on malgo's real-time audio thread. The
-	// callback type is `func(in, out []byte, framecount uint32)`; for
-	// capture devices, the `out` slice is unused and `in` carries the
-	// captured bytes (interleaved float32 mono because we asked for it).
-	onSamples := func(in, _ []byte, framecount uint32) {
+	// Capture callback runs on malgo's real-time audio thread.
+	// DataProc signature: func(pOutputSample, pInputSamples []byte, framecount uint32)
+	// For capture devices, pOutputSample is unused and pInputSamples carries captured audio.
+	onSamples := func(_, in []byte, framecount uint32) {
 		if s.closing.Load() {
 			return
 		}
@@ -196,8 +216,6 @@ func (s *Stream) Stop() {
 	if !s.closing.CompareAndSwap(false, true) {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.device != nil {
 		_ = s.device.Stop()
 		s.device.Uninit()

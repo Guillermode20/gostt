@@ -30,17 +30,17 @@ type runner struct {
 }
 
 func (r *runner) onReady() {
-	systray.SetTitle("gott")
-	systray.SetTooltip("gott — offline speech-to-text")
+	systray.SetTitle("gostt")
+	systray.SetTooltip("gostt — offline speech-to-text")
 	r.mStatus = systray.AddMenuItem("Status: starting", "Application status")
 	r.mStatus.Disable()
 	systray.AddSeparator()
 	r.mHotkey = systray.AddMenuItem("Hotkey: -", "Hold-to-talk hotkey")
 	r.mHotkey.Disable()
 	systray.AddSeparator()
-	r.mToggle = systray.AddMenuItem("Show / Hide Window", "Toggle the gott window")
+	r.mToggle = systray.AddMenuItem("Show / Hide Window", "Toggle the gostt window")
 	systray.AddSeparator()
-	r.mQuit = systray.AddMenuItem("Quit gott", "Exit the application")
+	r.mQuit = systray.AddMenuItem("Quit gostt", "Exit the application")
 	go r.pump()
 }
 

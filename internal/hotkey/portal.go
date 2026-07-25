@@ -372,5 +372,5 @@ func randomToken() string {
 	return "gott_" + string(b)
 }
 
-// env is used only so that debug codepaths can branch on $GOTT_DEBUG.
-var _ = func() bool { return os.Getenv("GOTT_DEBUG") != "" }
+// env is used only so that debug codepaths can branch on $GOSTT_DEBUG.
+var _ = func() bool { return os.Getenv("GOSTT_DEBUG") != "" }
