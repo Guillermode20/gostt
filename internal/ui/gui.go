@@ -333,7 +333,6 @@ func (w *Window) apply(u gottApp.Update) {
 	}
 	if u.InputLevel >= 0 {
 		_ = w.state.InputLevel.Set(float64(u.InputLevel))
-		fyne.Do(func() { w.levelBar.SetValue(float64(u.InputLevel)) })
 	}
 	if u.Transcription != "" {
 		_ = w.state.Transcription.Set(u.Transcription)

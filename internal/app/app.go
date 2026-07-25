@@ -133,7 +133,7 @@ func New(opts Options) (*App, error) {
 		opts:       opts,
 		cfg:        cfg,
 		state:      StateIdle,
-		chanUpdate: make(chan Update, 32),
+		chanUpdate: make(chan Update, 128),
 		chanMic:    make(chan []audio.MicInfo, 4),
 		chanHotkey: make(chan hotkey.Event, 8),
 		chanWorker: make(chan WorkerMsg, 16),
