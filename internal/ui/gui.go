@@ -331,9 +331,6 @@ func (w *Window) apply(u gottApp.Update) {
 	if u.Status != "" {
 		fyne.Do(func() { w.setStatus(u.Status) })
 	}
-	if u.InputLevel >= 0 {
-		_ = w.state.InputLevel.Set(float64(u.InputLevel))
-	}
 	if u.Transcription != "" {
 		_ = w.state.Transcription.Set(u.Transcription)
 		fyne.Do(func() { w.transcript.SetText(u.Transcription) })
@@ -389,16 +386,13 @@ func (w *Window) apply(u gottApp.Update) {
 func (w *Window) setStatus(s string) { w.statusLabel.SetText(s) }
 
 func (w *Window) pollUpdates() {
-	t := time.NewTicker(120 * time.Millisecond)
-	defer t.Stop()
+	levelCh := w.a.LevelChannel()
 	for {
 		select {
 		case <-w.pollerStop:
 			return
-		case <-t.C:
-			if lvl, err := w.state.InputLevel.Get(); err == nil {
-				fyne.Do(func() { w.levelBar.SetValue(lvl) })
-			}
+		case lvl := <-levelCh:
+			fyne.Do(func() { w.levelBar.SetValue(float64(lvl)) })
 		}
 	}
 }

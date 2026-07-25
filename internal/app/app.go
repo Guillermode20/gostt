@@ -115,6 +115,7 @@ type App struct {
 	chanHotkey chan hotkey.Event
 	chanWorker chan WorkerMsg
 	chanTray   chan tray.Status
+	chanLevel  chan float32
 
 	// keepLastBuffer reserves audio captured during hold-to-talk so the
 	// worker can transcribe it on Stop. Cleared each cycle.
@@ -132,15 +133,17 @@ func New(opts Options) (*App, error) {
 	return &App{
 		opts:       opts,
 		cfg:        cfg,
-		state:      StateIdle,
 		chanUpdate: make(chan Update, 128),
 		chanMic:    make(chan []audio.MicInfo, 4),
 		chanHotkey: make(chan hotkey.Event, 8),
 		chanWorker: make(chan WorkerMsg, 16),
 		chanTray:   make(chan tray.Status, 16),
+		chanLevel:  make(chan float32, 64),
 	}, nil
 }
 
+// LevelChannel returns the read side of the audio level channel.
+func (a *App) LevelChannel() <-chan float32 { return a.chanLevel }
 // UpdateChannel is the read side of chanUpdate.
 func (a *App) UpdateChannel() <-chan Update { return a.chanUpdate }
 
@@ -571,13 +574,17 @@ func (a *App) onAudioChunk(chunk []float32) {
 	a.recBuf = append(a.recBuf, chunk...)
 }
 
-// onAudioLevel is throttled — we don't want 100 Hz UI repaints.
+// onAudioLevel sets the level binding directly — it MUST NOT go through
+// publish because Update's zero State is StateIdle, which would flood
+// the GUI with spurious "idle" resets (overriding StateRecording, etc).
 func (a *App) onAudioLevel(level float32) {
-	if a.stream == nil {
+	if a.chanLevel == nil {
 		return
 	}
-	// Reuse the Update channel and rely on Fyne binding's coalescing.
-	a.publish(Update{InputLevel: level})
+	select {
+	case a.chanLevel <- level:
+	default:
+	}
 }
 
 // publish fans out an Update to listeners.
