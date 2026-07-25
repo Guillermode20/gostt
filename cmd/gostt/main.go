@@ -11,15 +11,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
-
 	"github.com/Guillermode20/gostt/internal/app"
 	"github.com/Guillermode20/gostt/internal/audio"
 	"github.com/Guillermode20/gostt/internal/settings"
@@ -42,6 +44,48 @@ ENVIRONMENT:
   XDG_SESSION_TYPE           detected automatically; controls input backend choice
 `
 
+func init() { loadDotenv() }
+
+// loadDotenv reads .env from the executable's directory (or CWD) and
+// sets env vars without overwriting existing ones.
+func loadDotenv() {
+	// Try executable dir first, then CWD.
+	dir := "."
+	if ex, err := os.Executable(); err == nil {
+		dir = filepath.Dir(ex)
+	}
+	f, err := os.Open(filepath.Join(dir, ".env"))
+	if err != nil {
+		// Try CWD as fallback.
+		if f2, err2 := os.Open(".env"); err2 == nil {
+			f = f2
+		} else {
+			return
+		}
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		// Strip surrounding quotes.
+		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		// Don't overwrite existing env vars.
+		if _, exists := os.LookupEnv(k); !exists {
+			os.Setenv(k, v)
+		}
+	}
+}
 func main() {
 	// Use stdlib flag for --help/-h so we get a uniform UX.
 	if len(os.Args) >= 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
